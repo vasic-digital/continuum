@@ -1,0 +1,18 @@
+# DRAFT — submodule-catalogue entry for the constitution's reusable-engine index
+# (§11.4.74 catalogue-first discovery). Consumers find "instant resume" here
+# before reimplementing it.
+- name: continuum
+  purpose: Instant, token-cheap resume of a whole parallel-development fleet.
+  capability: >
+    Durable content-addressed multi-stream snapshot store. Whole fleet (Tracks +
+    main + agents) captured atomically into one Merkle manifest; a fresh session
+    resumes in O(changed) reads (manifest + one blob per stream), never the
+    O(history) ledger. Tamper-evident, deterministic, single-writer, crash-safe.
+  path: constitution/submodules/continuum
+  github: git@github.com:vasic-digital/continuum.git
+  gitlab: git@gitlab.com:vasic-digital/continuum.git
+  language: go
+  deps: none (Go stdlib only)
+  extends_anchors: ["12.10", "11.4.127", "11.4.131", "11.4.205"]
+  new_anchor: "11.4.207"
+  helix_deps: helix-deps.yaml

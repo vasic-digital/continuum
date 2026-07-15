@@ -1,0 +1,40 @@
+# Go build artefacts (regeneratable — never version-controlled, §11.4.30)
+/bin/
+/build/
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.o
+*.a
+coverage.out
+coverage.html
+
+# Go workspace / module cache
+/vendor/
+go.work
+go.work.sum
+
+# Runtime store state produced by e2e/integration runs (regeneratable)
+/.continuum/
+*.continuum-store/
+qa-results/
+
+# Secrets — NEVER commit (this repo is public, §11.4.10)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Editor / OS state
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db

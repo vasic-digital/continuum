@@ -1,0 +1,41 @@
+# Continuum HelixQA Challenge bank (§11.4.58 layer 4 / §11.4.27).
+#
+# Consumer-owned DATA (the bank machinery is generic; this file registers the
+# engine's challenges). Each challenge dispatches to the REAL CLI binary and
+# scores PASS only on positive CAPTURED evidence (§11.4.69) — never on
+# absence-of-error or metadata alone.
+bank: continuum
+schema_version: 1
+runner: test/challenges/run_challenge.sh   # produces result.json (verdict + evidence paths)
+challenges:
+  - id: CME-CONTINUUM-001
+    title: Fresh-session resume rehydrates the whole fleet byte-identically
+    feature_class: boot_service          # §11.4.69 taxonomy (resume-from-committed-state)
+    dispatch: real-cli
+    asserts:
+      - a new process (fresh store handle) restores every stream committed by a prior process
+      - canonical(restored) == canonical(original) for every stream (byte-identical)
+    evidence: qa-results/challenge/roundtrip.json
+  - id: CME-CONTINUUM-002
+    title: Resume reads O(streams), not O(history)
+    feature_class: boot_service
+    dispatch: real-cli
+    asserts:
+      - resume metric blobs_read == 1 (manifest) + N (streams)
+      - the event ledger is never read on the resume path
+    evidence: qa-results/challenge/resume_metric.json
+  - id: CME-CONTINUUM-003
+    title: The verifier cannot bluff (self-validating oracle)
+    feature_class: boot_service
+    dispatch: real-cli
+    asserts:
+      - golden-good PASS AND golden-bad detected as FAIL AND negative-control PASS
+    evidence: qa-results/challenge/selfcheck.txt
+  - id: CME-CONTINUUM-004
+    title: On-disk corruption is detected, never silently restored
+    feature_class: storage_read
+    dispatch: real-cli
+    asserts:
+      - a tampered stream blob makes verify report FAIL
+      - restore refuses the corrupt blob (integrity, not a silent bad read)
+    evidence: qa-results/challenge/corruption.txt

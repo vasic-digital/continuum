@@ -1,0 +1,10 @@
+# DRAFT — appended to the constitution submodule's .gitmodules (§11.4.28(C) carve-out).
+# Apply INSIDE the constitution submodule working tree after §11.4.26 step-1 fetch+pull.
+# Do NOT self-commit; hand to the conductor for the §11.4.26 pipeline.
+
+--- a/.gitmodules
++++ b/.gitmodules
+@@
++[submodule "submodules/continuum"]
++	path = submodules/continuum
++	url = git@github.com:vasic-digital/continuum.git

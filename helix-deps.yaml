@@ -1,0 +1,21 @@
+# Continuum — submodule dependency manifest (§11.4.31)
+#
+# Continuum is a leaf reusable engine: it has ZERO own-org Git dependencies and
+# ZERO third-party module dependencies (Go stdlib only). It is inherited BY
+# REFERENCE as a depth-1 submodule under the constitution submodule per the
+# §11.4.28(C) carve-out (constitution/submodules/continuum/), and nests no
+# further own-org submodules.
+schema_version: 1
+name: continuum
+ssh_url: git@github.com:vasic-digital/continuum.git
+mirrors:
+  - git@github.com:vasic-digital/continuum.git
+  - git@gitlab.com:vasic-digital/continuum.git
+language: go
+language_specific_subtree: false
+deps: []                       # zero own-org deps (leaf engine)
+transitive_handling:
+  recursive: true
+  conflict_resolution: operator-required
+project_agnostic: true         # §11.4.28(B)/§11.4.177 — carries no project literals
+carve_out: "§11.4.28(C) depth-1 reusable engine under constitution/submodules/"
