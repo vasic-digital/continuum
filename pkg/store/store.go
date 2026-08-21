@@ -26,8 +26,10 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/vasic-digital/continuum/pkg/hash"
+	"github.com/vasic-digital/continuum/pkg/lock"
 	"github.com/vasic-digital/continuum/pkg/model"
 )
 
@@ -40,7 +42,32 @@ const (
 	HeadRef = "HEAD"
 	// workingFile holds the mutable, staged streamID->contentHash manifest.
 	workingFile = "working.json"
+	// eventsLockFile is the DEDICATED advisory lockfile guarding sequence
+	// assignment. It is deliberately NOT the ledger itself: a lock held on a
+	// data file is lost the moment that file is replaced (pkg/lock).
+	eventsLockFile = "events.lock"
 )
+
+const (
+	// appendLockWait bounds how long an append blocks on a live holder before
+	// refusing. It refuses loudly rather than assigning a sequence it could not
+	// order.
+	appendLockWait = 30 * time.Second
+	// appendLockPoll is the retry interval while waiting; small enough that a
+	// contended append is not dominated by sleep.
+	appendLockPoll = 2 * time.Millisecond
+)
+
+// ErrUnverifiableTail reports that the event ledger contains a record whose
+// position in the total order cannot be established — an unparseable line, or a
+// line carrying no sequence. AppendEvent REFUSES rather than deriving a
+// sequence from a tail it never verified.
+//
+// It is exported so a caller can tell "this ledger is not safe to append to"
+// from an I/O failure with errors.Is, rather than by matching message text: an
+// error string is not an interface, and a gate that greps one is an instrument
+// that breaks silently when the wording changes (§11.4.201).
+var ErrUnverifiableTail = errors.New("continuum/store: unverifiable ledger tail")
 
 // Store is a handle to a continuum store rooted at Root.
 type Store struct {
@@ -230,30 +257,92 @@ func (s *Store) GetState(id string) (model.StreamState, error) {
 
 // ---- append-only event ledger ---------------------------------------------
 
-func (s *Store) loadSeq() error {
+// scanLastSeq reads the ledger from disk and returns the highest sequence it
+// records (0 when the ledger does not exist yet).
+//
+// This is the ONLY authority on the next sequence number. The in-memory
+// Store.seq is a cache, and a per-handle cache cannot order two handles: two
+// handles opened before either appends both cache the same value and both hand
+// out the same next sequence. Callers assigning a sequence MUST call this
+// while holding the append lock (see AppendEvent).
+//
+// It VERIFIES the tail rather than merely skimming it: every non-blank line
+// must parse as an Event and must carry a sequence, and the first line that
+// does not is reported as ErrUnverifiableTail instead of being skipped.
+// Skipping WAS the defect. An unparseable record read as ABSENT lowers the
+// derived maximum, so the next append re-issues a sequence the ledger already
+// contains, and the total order the snapshot chain depends on (§11.4.207)
+// silently acquires two records claiming one position — a corruption the
+// ledger itself would then say nothing about.
+//
+// On a fault it still returns the highest sequence VERIFIED before that line,
+// so a caller that deliberately tolerates the fault (loadSeq) gets a truthful,
+// never inflated, value.
+func (s *Store) scanLastSeq() (int64, error) {
 	f, err := os.Open(filepath.Join(s.Root, logDir, logFile))
 	if errors.Is(err, os.ErrNotExist) {
-		atomic.StoreInt64(&s.seq, 0)
-		return nil
+		return 0, nil
 	}
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer f.Close()
 	var last int64
+	lineNo := 0
+	ledger := filepath.Join(logDir, logFile)
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
+		lineNo++
 		line := strings.TrimSpace(sc.Text())
 		if line == "" {
 			continue
 		}
 		var ev model.Event
-		if err := json.Unmarshal([]byte(line), &ev); err == nil && ev.Seq > last {
+		if perr := json.Unmarshal([]byte(line), &ev); perr != nil {
+			return last, fmt.Errorf("%w: %s line %d is malformed and could not be parsed (%v)",
+				ErrUnverifiableTail, ledger, lineNo, perr)
+		}
+		// A line that parses but carries no sequence is equally unverifiable: it
+		// occupies no position in the total order, so a maximum derived past it
+		// is derived past an unknown. This cannot fire on a record this package
+		// wrote — AppendEvent assigns last+1 from a last that starts at 0 and
+		// only rises, so every written record carries seq >= 1. That is why the
+		// check cannot refuse a healthy ledger (§11.4.201(1): a false refusal is
+		// as serious as a false pass).
+		if ev.Seq < 1 {
+			return last, fmt.Errorf("%w: %s line %d parses but carries no sequence (seq=%d)",
+				ErrUnverifiableTail, ledger, lineNo, ev.Seq)
+		}
+		if ev.Seq > last {
 			last = ev.Seq
 		}
 	}
 	if err := sc.Err(); err != nil {
+		return last, err
+	}
+	return last, nil
+}
+
+// loadSeq refreshes the in-memory cache from disk. The cache is observational
+// only — it is NEVER the source of an assigned sequence.
+//
+// An unverifiable tail is deliberately NOT fatal HERE, and the asymmetry with
+// AppendEvent is the point: the refusal belongs at the seam that would ACT on
+// the unverified tail, not at the seam that merely reads it (§11.4.120). Open
+// certifies nothing, and refusing here would make a damaged ledger impossible
+// to open and therefore impossible to inspect or repair — an outage, not a fix.
+// The cache is then set to the highest sequence verified BEFORE the fault, so
+// it under-reports rather than over-reports, and nothing derives a sequence
+// from it in any case.
+//
+// The tolerance is narrow and named: ONLY ErrUnverifiableTail is absorbed.
+// Every other error — a read failure, an over-long line — still propagates, so
+// this is the opposite of the blanket err-swallow the tail verification exists
+// to remove.
+func (s *Store) loadSeq() error {
+	last, err := s.scanLastSeq()
+	if err != nil && !errors.Is(err, ErrUnverifiableTail) {
 		return err
 	}
 	atomic.StoreInt64(&s.seq, last)
@@ -263,8 +352,49 @@ func (s *Store) loadSeq() error {
 // AppendEvent assigns the next sequence number and appends ev to the ledger,
 // fsyncing so the record is durable. The caller supplies ev.Time (the audit
 // clock) and the semantic fields.
-func (s *Store) AppendEvent(ev model.Event) (model.Event, error) {
-	ev.Seq = atomic.AddInt64(&s.seq, 1)
+//
+// Sequence assignment is derived from the ledger tail ON DISK while holding an
+// exclusive advisory lock across read-tail-then-append, never from the
+// open-time cached counter. The cache is per-handle, so two handles opened
+// before either appends would both hand out the same sequence and the ledger
+// would carry two records claiming one position in a total order the snapshot
+// chain depends on (§11.4.207). Holding the lock across BOTH the read and the
+// write is what makes the derivation atomic: releasing between them would
+// reintroduce the same duplicate under a different name.
+//
+// The same lock-held read is also the tail VERIFICATION: scanLastSeq refuses an
+// unparseable or sequence-less record instead of skipping it, so AppendEvent
+// returns ErrUnverifiableTail rather than assigning a position on a tail it
+// could not verify. The refusal path runs after the lock's release is deferred,
+// so a refused append frees the lock exactly as a successful one does — a
+// refusal that stranded the lock would convert one damaged ledger into a
+// permanently blocked store.
+func (s *Store) AppendEvent(ev model.Event) (_ model.Event, err error) {
+	lk, lerr := lock.Acquire(filepath.Join(s.Root, logDir, eventsLockFile), lock.Options{
+		Wait: appendLockWait,
+		Poll: appendLockPoll,
+	})
+	if lerr != nil {
+		return ev, fmt.Errorf("continuum/store: acquiring append lock: %w", lerr)
+	}
+	// Released only after the record is durable. A release failure is reported
+	// rather than swallowed (§11.4.252) — it leaves a lockfile behind, and a
+	// silent one would strand every later append.
+	defer func() {
+		if rerr := lk.Release(); rerr != nil && err == nil {
+			err = fmt.Errorf("continuum/store: releasing append lock: %w", rerr)
+		}
+	}()
+
+	// ---- under the exclusive lock ----
+	// This read both derives the next sequence AND verifies the tail; the error
+	// below is therefore the refusal branch as well as the I/O branch.
+	last, err := s.scanLastSeq()
+	if err != nil {
+		return ev, err
+	}
+	ev.Seq = last + 1
+
 	b, err := json.Marshal(ev)
 	if err != nil {
 		return ev, err
@@ -280,6 +410,8 @@ func (s *Store) AppendEvent(ev model.Event) (model.Event, error) {
 	if err := f.Sync(); err != nil {
 		return ev, err
 	}
+	// Keep the observational cache truthful rather than stale.
+	atomic.StoreInt64(&s.seq, ev.Seq)
 	return ev, nil
 }
 
