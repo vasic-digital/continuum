@@ -50,7 +50,7 @@ func TestAcquire_NoStarvationUnderTightLoopContention(t *testing.T) {
 	// the waiter after at most the 8 loopers queued ahead of it, whereas the
 	// unfair O_EXCL poll lets the loopers take dozens of turns first. A host
 	// stall freezes the loopers too, so it cannot fake starvation (a wall-clock
-	// budget flaked about 1 run in 35 on an overloaded host even at 1s).
+	// budget flaked intermittently on an overloaded host, roughly 3 runs in 140 measured, even at 1s).
 	const maxTurns = 40
 	var starved error
 	var worst int64
