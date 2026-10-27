@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -34,6 +35,33 @@ func TestAcquire_WaitBudgetChargedAtGate(t *testing.T) {
 		t.Fatalf("blocked %s with Wait=%s: gate wait was not charged to the budget", el, W)
 	}
 	if el < W*8/10 {
+		t.Fatalf("returned after %s, before the Wait budget %s", el, W)
+	}
+}
+
+// R2 killer: the gate is NEVER freed (the in-process holder never releases).
+// Acquire must give up at about Wait with the documented timeout error, not at
+// 2*Wait and not before Wait.
+func TestAcquire_NeverFreedGateTimesOutAtWait(t *testing.T) {
+	const W = 600 * time.Millisecond
+	p := filepath.Join(t.TempDir(), "never.lock")
+	g := gateFor(p)
+	g <- struct{}{} // occupied for the whole test
+	defer func() { <-g }()
+	start := time.Now()
+	l, err := Acquire(p, Options{Wait: W, Poll: 5 * time.Millisecond})
+	el := time.Since(start)
+	if err == nil {
+		_ = l.Release()
+		t.Fatal("expected timeout: the gate is never freed")
+	}
+	if !strings.Contains(err.Error(), "timed out acquiring") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if el > W*125/100 {
+		t.Fatalf("blocked %s with Wait=%s: gate wait exceeds the Wait budget", el, W)
+	}
+	if el < W*9/10 {
 		t.Fatalf("returned after %s, before the Wait budget %s", el, W)
 	}
 }

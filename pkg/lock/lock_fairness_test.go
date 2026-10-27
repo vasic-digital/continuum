@@ -41,7 +41,10 @@ func TestAcquire_NoStarvationUnderTightLoopContention(t *testing.T) {
 	time.Sleep(50 * time.Millisecond) // let the loopers reach steady state
 
 	// Repeat the waiter trial: a single trial on the unfair lock wins by luck
-	// roughly one trial in five, K independent trials make a false GREEN rare.
+	// roughly one trial in five. The trials are CORRELATED (they share the
+	// loopers and the lock), so they are not independent draws; that is why a
+	// contention precondition is enforced per trial below instead of relying on
+	// the trial count alone.
 	const trials = 15
 	// Fairness is measured in HOLDER TURNS, not wall-clock: a FIFO gate admits
 	// the waiter after at most the 8 loopers queued ahead of it, whereas the
@@ -52,6 +55,21 @@ func TestAcquire_NoStarvationUnderTightLoopContention(t *testing.T) {
 	var starved error
 	var worst int64
 	for i := 0; i < trials && starved == nil; i++ {
+		// Gap between trials: wait until the loopers have taken a turn since the
+		// previous trial. On the unfair lock a waiter that wins one trial and
+		// re-acquires back-to-back starves the loopers (worst 0 holder turns, a
+		// vacuous pass); the gap hands them the lock so every trial is contended.
+		gapFrom := turns.Load()
+		for gapDeadline := time.Now().Add(10 * time.Second); turns.Load() == gapFrom; {
+			if time.Now().After(gapDeadline) {
+				starved = fmt.Errorf("trial %d: no looper took a turn in the inter-trial gap; contention precondition not met", i)
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		if starved != nil {
+			break
+		}
 		before := turns.Load()
 		l, err := Acquire(p, Options{Wait: 30 * time.Second})
 		took := turns.Load() - before
@@ -60,6 +78,11 @@ func TestAcquire_NoStarvationUnderTightLoopContention(t *testing.T) {
 		}
 		if err != nil {
 			starved = fmt.Errorf("trial %d: waiter gave up after %d holder turns: %w", i, took, err)
+			break
+		}
+		if took < 1 {
+			starved = fmt.Errorf("trial %d: vacuous: 0 holder turns passed while the waiter waited (no contention), the waiter did not queue behind a holder", i)
+			_ = l.Release()
 			break
 		}
 		if took > maxTurns {
