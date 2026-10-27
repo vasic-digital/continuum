@@ -21,6 +21,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -30,6 +32,24 @@ type Lock struct {
 	path  string
 	pid   int
 	stamp string // the exact content we wrote, to prove ownership on Release
+	gate  chan struct{}
+	freed atomic.Bool // gate released exactly once even if Release is called twice
+}
+
+// gates serialises in-process contenders per lock path in FIFO order. The
+// O_EXCL create is an unfair try-lock: a holder that re-acquires in a loop
+// recreates the file within microseconds of Release, while a waiter only
+// samples it every Poll, so a waiter can starve until its Wait budget expires
+// although no holder is dead or stuck (reproduced: TestStress_ConcurrentWriters,
+// first Set timed out after 15s with 276 other Sets completing). A buffered
+// channel's blocked receivers are served in arrival order, so admitting one
+// in-process contender at a time to the file protocol removes the starvation.
+// Cross-process fairness is NOT provided (residual, see Acquire).
+var gates sync.Map // path -> chan struct{} (capacity 1)
+
+func gateFor(path string) chan struct{} {
+	g, _ := gates.LoadOrStore(path, make(chan struct{}, 1))
+	return g.(chan struct{})
 }
 
 // Options tune acquisition.
@@ -89,6 +109,26 @@ func Acquire(path string, opts Options) (*Lock, error) {
 		return nil, err
 	}
 	deadline := opts.now().Add(opts.Wait)
+
+	// FIFO in-process admission, bounded by the same Wait budget.
+	gate := gateFor(path)
+	timer := time.NewTimer(opts.Wait)
+	select {
+	case gate <- struct{}{}:
+		timer.Stop()
+	case <-timer.C:
+		return nil, fmt.Errorf("continuum/lock: timed out acquiring %s (held by a live holder)", path)
+	}
+	l, err := acquireFile(path, opts, deadline)
+	if err != nil {
+		<-gate
+		return nil, err
+	}
+	l.gate = gate
+	return l, nil
+}
+
+func acquireFile(path string, opts Options, deadline time.Time) (*Lock, error) {
 	pid := os.Getpid()
 	stamp := fmt.Sprintf("%d\n%d\n", pid, opts.now().UnixNano())
 
@@ -196,6 +236,10 @@ func logDecision(w io.Writer, decision, path string, pid int, reason string) {
 func (l *Lock) Release() error {
 	if l == nil {
 		return nil
+	}
+	if l.gate != nil && l.freed.CompareAndSwap(false, true) {
+		// Admit the next in-process waiter only after the lockfile is gone.
+		defer func() { <-l.gate }()
 	}
 	cur, err := os.ReadFile(l.path)
 	if errors.Is(err, os.ErrNotExist) {
