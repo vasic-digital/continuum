@@ -48,6 +48,12 @@ type Lock struct {
 var gates sync.Map // path -> chan struct{} (capacity 1)
 
 func gateFor(path string) chan struct{} {
+	// Key on the cleaned absolute path so "x", "./x" and "d/../x" share a gate.
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	} else {
+		path = filepath.Clean(path)
+	}
 	g, _ := gates.LoadOrStore(path, make(chan struct{}, 1))
 	return g.(chan struct{})
 }
@@ -119,12 +125,20 @@ func Acquire(path string, opts Options) (*Lock, error) {
 	case <-timer.C:
 		return nil, fmt.Errorf("continuum/lock: timed out acquiring %s (held by a live holder)", path)
 	}
+	// Free the slot on every non-success exit, including a panic raised by
+	// injected alive/Evidence code inside acquireFile.
+	acquired := false
+	defer func() {
+		if !acquired {
+			<-gate
+		}
+	}()
 	l, err := acquireFile(path, opts, deadline)
 	if err != nil {
-		<-gate
 		return nil, err
 	}
 	l.gate = gate
+	acquired = true
 	return l, nil
 }
 

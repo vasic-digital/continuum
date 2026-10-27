@@ -1,6 +1,7 @@
 package lock
 
 import (
+	"fmt"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -37,16 +38,28 @@ func TestAcquire_NoStarvationUnderTightLoopContention(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond) // let the loopers reach steady state
 
-	start := time.Now()
-	l, err := Acquire(p, Options{Wait: 500 * time.Millisecond})
-	waited := time.Since(start)
-	stop.Store(true)
-	if err == nil {
+	// Repeat the waiter trial: a single trial on the unfair lock wins by luck
+	// roughly one trial in five, K independent trials make a false GREEN rare.
+	const trials = 15
+	var starved error
+	var worst time.Duration
+	for i := 0; i < trials && starved == nil; i++ {
+		start := time.Now()
+		l, err := Acquire(p, Options{Wait: 200 * time.Millisecond})
+		waited := time.Since(start)
+		if waited > worst {
+			worst = waited
+		}
+		if err != nil {
+			starved = fmt.Errorf("trial %d: waiter starved: gave up after %s while holders cycled (no dead holder): %w", i, waited, err)
+			break
+		}
 		_ = l.Release()
 	}
+	stop.Store(true)
 	wg.Wait()
-	if err != nil {
-		t.Fatalf("waiter starved: gave up after %s while holders cycled (no dead holder): %v", waited, err)
+	if starved != nil {
+		t.Fatal(starved)
 	}
-	t.Logf("waiter acquired after %s", waited)
+	t.Logf("%d waiter trials ok, worst wait %s", trials, worst)
 }
