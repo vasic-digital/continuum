@@ -20,6 +20,7 @@ import (
 func TestAcquire_NoStarvationUnderTightLoopContention(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "fair.lock")
 	var stop atomic.Bool
+	var turns atomic.Int64 // total looper acquisitions, a scheduler-independent clock
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
@@ -31,6 +32,7 @@ func TestAcquire_NoStarvationUnderTightLoopContention(t *testing.T) {
 					t.Errorf("looper acquire: %v", err)
 					return
 				}
+				turns.Add(1)
 				time.Sleep(2 * time.Millisecond) // critical section
 				_ = l.Release()
 			}
@@ -41,17 +43,28 @@ func TestAcquire_NoStarvationUnderTightLoopContention(t *testing.T) {
 	// Repeat the waiter trial: a single trial on the unfair lock wins by luck
 	// roughly one trial in five, K independent trials make a false GREEN rare.
 	const trials = 15
+	// Fairness is measured in HOLDER TURNS, not wall-clock: a FIFO gate admits
+	// the waiter after at most the 8 loopers queued ahead of it, whereas the
+	// unfair O_EXCL poll lets the loopers take dozens of turns first. A host
+	// stall freezes the loopers too, so it cannot fake starvation (a wall-clock
+	// budget flaked about 1 run in 35 on an overloaded host even at 1s).
+	const maxTurns = 40
 	var starved error
-	var worst time.Duration
+	var worst int64
 	for i := 0; i < trials && starved == nil; i++ {
-		start := time.Now()
-		l, err := Acquire(p, Options{Wait: 200 * time.Millisecond})
-		waited := time.Since(start)
-		if waited > worst {
-			worst = waited
+		before := turns.Load()
+		l, err := Acquire(p, Options{Wait: 30 * time.Second})
+		took := turns.Load() - before
+		if took > worst {
+			worst = took
 		}
 		if err != nil {
-			starved = fmt.Errorf("trial %d: waiter starved: gave up after %s while holders cycled (no dead holder): %w", i, waited, err)
+			starved = fmt.Errorf("trial %d: waiter gave up after %d holder turns: %w", i, took, err)
+			break
+		}
+		if took > maxTurns {
+			starved = fmt.Errorf("trial %d: waiter starved: %d holder turns passed before it was admitted (fair bound ~8, limit %d)", i, took, maxTurns)
+			_ = l.Release()
 			break
 		}
 		_ = l.Release()
@@ -61,5 +74,5 @@ func TestAcquire_NoStarvationUnderTightLoopContention(t *testing.T) {
 	if starved != nil {
 		t.Fatal(starved)
 	}
-	t.Logf("%d waiter trials ok, worst wait %s", trials, worst)
+	t.Logf("%d waiter trials ok, worst %d holder turns", trials, worst)
 }

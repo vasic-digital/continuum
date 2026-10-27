@@ -42,9 +42,19 @@ type Lock struct {
 // samples it every Poll, so a waiter can starve until its Wait budget expires
 // although no holder is dead or stuck (reproduced: TestStress_ConcurrentWriters,
 // first Set timed out after 15s with 276 other Sets completing). A buffered
-// channel's blocked receivers are served in arrival order, so admitting one
-// in-process contender at a time to the file protocol removes the starvation.
+// channel hands its slot to blocked senders (waiters) in the order they began
+// waiting, so admitting one in-process contender at a time to the file protocol
+// removes the starvation.
 // Cross-process fairness is NOT provided (residual, see Acquire).
+//
+// Known limitations (documented, deliberately not fixed here):
+//   - Lock.path keeps the path as given; a relative-path Release after a chdir
+//     checks the wrong file and can orphan the real lockfile (pre-existing).
+//   - Gates key on the cleaned absolute path without resolving symlinks, so two
+//     symlinked spellings of one file get separate gates (fairness only; mutual
+//     exclusion is still enforced by O_EXCL).
+//   - A slot leak on the Wait-timeout path at the instant the gate frees cannot
+//     be tested without an injectable timer; the code has no such leak.
 var gates sync.Map // path -> chan struct{} (capacity 1)
 
 func gateFor(path string) chan struct{} {
