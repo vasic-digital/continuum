@@ -18,13 +18,16 @@ package store
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -73,7 +76,21 @@ var ErrUnverifiableTail = errors.New("continuum/store: unverifiable ledger tail"
 type Store struct {
 	Root string
 	seq  int64 // last assigned event seq (loaded lazily)
+
+	// Verified-prefix cache for scanLastSeq: the ledger file identity, the byte
+	// offset just past the last newline-terminated line already verified, the
+	// highest sequence and line count seen up to it. Guarded by scanMu.
+	scanMu  sync.Mutex
+	vInfo   os.FileInfo
+	vOff    int64
+	vLast   int64
+	vLineNo int
+	vWin    []byte
 }
+
+// scanBytesRead counts ledger bytes read by scanLastSeq (observability for the
+// incremental-scan cost test; also a cheap production diagnostic).
+var scanBytesRead atomic.Int64
 
 // Open returns a Store handle for root, creating the directory skeleton if
 // absent. It is safe to Open the same root from many processes.
@@ -281,47 +298,154 @@ func (s *Store) GetState(id string) (model.StreamState, error) {
 func (s *Store) scanLastSeq() (int64, error) {
 	f, err := os.Open(filepath.Join(s.Root, logDir, logFile))
 	if errors.Is(err, os.ErrNotExist) {
+		s.scanMu.Lock()
+		s.vInfo, s.vOff, s.vLast, s.vLineNo, s.vWin = nil, 0, 0, 0, nil
+		s.scanMu.Unlock()
 		return 0, nil
 	}
 	if err != nil {
 		return 0, err
 	}
 	defer f.Close()
-	var last int64
-	lineNo := 0
+	info, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+
+	// Incremental verification: if this handle already verified a prefix of THIS
+	// file (same inode/device, not truncated), resume at the offset just past the
+	// last verified newline-terminated line instead of re-reading and re-parsing
+	// the whole ledger under the exclusive lock on every append. A replaced or
+	// truncated file voids the cache and the whole ledger is verified again.
+	// Honest limit: bytes ALREADY verified by this handle are not re-read, so an
+	// in-place rewrite of an old line after its verification is not detected by
+	// the append path (the hash chain and verify.* own that); every byte this
+	// handle has not yet verified, including anything another process appended,
+	// is parsed as before.
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+	// termLast/termLines/off describe the verified, newline-terminated prefix only;
+	// last additionally folds in an unterminated tail, which is never cached.
+	termLast, termLines, off := int64(0), 0, int64(0)
+	var oldWin []byte // window of the reused prefix; empty on a full scan
+	if s.vInfo != nil && os.SameFile(s.vInfo, info) && info.Size() >= s.vOff && s.windowIntact(f) {
+		termLast, termLines, off, oldWin = s.vLast, s.vLineNo, s.vOff, s.vWin
+	}
+	last, lineNo := termLast, termLines
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		return 0, err
+	}
 	ledger := filepath.Join(logDir, logFile)
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for sc.Scan() {
-		lineNo++
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
+	const maxLine = 4 * 1024 * 1024 // same bound the bufio.Scanner enforced
+	r := bufio.NewReaderSize(f, 64*1024)
+	var consumed []byte // tail bytes of the verified prefix, for the next window
+	for {
+		raw, terminated, rerr := readBoundedLine(r, maxLine)
+		scanBytesRead.Add(int64(len(raw)))
+		if errors.Is(rerr, bufio.ErrTooLong) {
+			return last, bufio.ErrTooLong
+		}
+		if len(raw) > 0 {
+			lineNo++
+			line := strings.TrimSpace(string(raw))
+			if line != "" {
+				var ev model.Event
+				if perr := json.Unmarshal([]byte(line), &ev); perr != nil {
+					return last, fmt.Errorf("%w: %s line %d is malformed and could not be parsed (%v)",
+						ErrUnverifiableTail, ledger, lineNo, perr)
+				}
+				// A line that parses but carries no sequence is equally
+				// unverifiable: it occupies no position in the total order, so a
+				// maximum derived past it is derived past an unknown. This cannot
+				// fire on a record this package wrote — AppendEvent assigns last+1
+				// from a last that starts at 0 and only rises, so every written
+				// record carries seq >= 1. That is why the check cannot refuse a
+				// healthy ledger (§11.4.201(1): a false refusal is as serious as a
+				// false pass).
+				if ev.Seq < 1 {
+					return last, fmt.Errorf("%w: %s line %d parses but carries no sequence (seq=%d)",
+						ErrUnverifiableTail, ledger, lineNo, ev.Seq)
+				}
+				if ev.Seq > last {
+					last = ev.Seq
+				}
+				if terminated && ev.Seq > termLast {
+					termLast = ev.Seq
+				}
+			}
+			if terminated {
+				off += int64(len(raw))
+				termLines = lineNo
+				consumed = append(consumed, raw...)
+				if len(consumed) > 2*windowSize {
+					consumed = append([]byte(nil), consumed[len(consumed)-windowSize:]...)
+				}
+			}
+		}
+		if rerr != nil {
+			if !errors.Is(rerr, io.EOF) {
+				return last, rerr
+			}
+			break
+		}
+	}
+	// Only a fully verified, newline-terminated prefix is cached (its maximum,
+	// its line count, its offset and a window of its last bytes). An unterminated
+	// final line (a record still being written) is re-read next time and
+	// contributes to this call's result but never to the cache, so removing it
+	// later cannot leave a phantom sequence behind.
+	win := append(append([]byte(nil), oldWin...), consumed...)
+	if len(win) > windowSize {
+		win = win[len(win)-windowSize:]
+	}
+	s.vInfo, s.vOff, s.vLast, s.vLineNo, s.vWin = info, off, termLast, termLines, win
+	return last, nil
+}
+
+// windowSize is how many bytes immediately before the cached offset are
+// re-compared before the cache is trusted.
+const windowSize = 256
+
+// windowIntact re-reads the bytes just before the cached offset and compares them
+// to the ones captured when the prefix was verified. It catches truncate-and-regrow
+// of the same inode (same file, size >= offset, different content), which a
+// size/identity check alone cannot. Honest limit: a rewrite that reproduces the
+// window byte-for-byte, or one confined to earlier bytes, is not detected here;
+// the hash chain and verify.* own that.
+func (s *Store) windowIntact(f *os.File) bool {
+	if s.vOff == 0 {
+		return true
+	}
+	n := int64(len(s.vWin))
+	if n == 0 || n > s.vOff {
+		return false
+	}
+	buf := make([]byte, n)
+	if _, err := f.ReadAt(buf, s.vOff-n); err != nil {
+		return false
+	}
+	return bytes.Equal(buf, s.vWin)
+}
+
+// readBoundedLine reads one line including its '\n', never holding more than max
+// bytes: a line longer than max (or an unterminated one that reaches max) is
+// bufio.ErrTooLong, matching the old Scanner bound without buffering unbounded
+// newline-free input.
+func readBoundedLine(r *bufio.Reader, max int) (line []byte, terminated bool, err error) {
+	for {
+		chunk, e := r.ReadSlice('\n')
+		line = append(line, chunk...)
+		if len(line) > max || (len(line) == max && (len(line) == 0 || line[len(line)-1] != '\n')) {
+			return line[:0], false, bufio.ErrTooLong
+		}
+		if e == nil {
+			return line, true, nil
+		}
+		if errors.Is(e, bufio.ErrBufferFull) {
 			continue
 		}
-		var ev model.Event
-		if perr := json.Unmarshal([]byte(line), &ev); perr != nil {
-			return last, fmt.Errorf("%w: %s line %d is malformed and could not be parsed (%v)",
-				ErrUnverifiableTail, ledger, lineNo, perr)
-		}
-		// A line that parses but carries no sequence is equally unverifiable: it
-		// occupies no position in the total order, so a maximum derived past it
-		// is derived past an unknown. This cannot fire on a record this package
-		// wrote — AppendEvent assigns last+1 from a last that starts at 0 and
-		// only rises, so every written record carries seq >= 1. That is why the
-		// check cannot refuse a healthy ledger (§11.4.201(1): a false refusal is
-		// as serious as a false pass).
-		if ev.Seq < 1 {
-			return last, fmt.Errorf("%w: %s line %d parses but carries no sequence (seq=%d)",
-				ErrUnverifiableTail, ledger, lineNo, ev.Seq)
-		}
-		if ev.Seq > last {
-			last = ev.Seq
-		}
+		return line, false, e
 	}
-	if err := sc.Err(); err != nil {
-		return last, err
-	}
-	return last, nil
 }
 
 // loadSeq refreshes the in-memory cache from disk. The cache is observational

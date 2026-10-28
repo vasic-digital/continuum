@@ -43,6 +43,13 @@ filesystem.
   torn write; the dir fsync makes the rename durable.
 - **Ledger** is append-only with a monotonic `Seq` that persists across process
   reopen (loaded by scanning the log's max seq).
+- **Incremental tail verification (0.1.2).** `AppendEvent` derives the next
+  sequence and verifies the ledger under the exclusive lock. A handle remembers
+  the verified, newline-terminated prefix of the file it saw (inode + offset) and
+  resumes there, so append cost is O(new bytes), not O(ledger). A replaced or
+  truncated file voids the cache. Honest limit: bytes already verified by a
+  handle are not re-read, so in-place tampering of an old line is detected by
+  `verify`/chain checks and by any fresh handle (`Open`), not by the append path.
 
 ## Lock (`pkg/lock`)
 
@@ -54,6 +61,20 @@ An advisory `O_CREATE|O_EXCL` lockfile holding `pid\nstamp`. On contention it
 - holder **alive** → KEEP (never steal — stealing corrupts a concurrent writer,
   §9.2);
 - unreadable/ambiguous → conservative KEEP.
+
+**Fairness (0.1.2).** Contenders queue by ticket: each waiter drops a file
+`<lock>.q/<nanostamp>-<pid>-<rand>`; only the head of the queue attempts the
+`O_EXCL` create, so a holder that releases and immediately re-acquires (even from
+another process) can no longer barge past a slower poller. A fast path takes no
+ticket when the queue is empty. Tickets of dead owners are reaped by `kill(pid,0)`
+and tickets older than the TTL are reaped regardless (pid-reuse backstop); a ticket whose mtime shows no heartbeat for max(2s, 20*Poll) is also reaped (frozen waiter). Reaping uses the reaper's own Poll/TTL, so waiters with a much larger Poll than the reaper may lose queue position (fairness only, never safety). The
+queue only orders contenders: mutual exclusion is still the `O_EXCL` create, and
+an unusable queue directory degrades to the old unfair-but-safe protocol. The
+lockfile itself is not fsynced (it carries no data that must survive a crash; a
+stale stamp names a dead pid and is reaped; an empty or garbled one left by a
+crash is reaped once older than the TTL). Within one process an additional
+FIFO gate keyed by the canonical path (directory symlinks resolved) orders
+goroutines. `Lock.path` is always absolute so `Release` survives a `chdir`.
 
 Every REAPED/KEEP decision is logged with its evidence (dead PID, age) — the
 9-hour-freeze fix (§11.4.180). `ProcessAlive` treats `EPERM` as alive (the PID

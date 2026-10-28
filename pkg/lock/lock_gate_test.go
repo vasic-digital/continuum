@@ -26,6 +26,12 @@ func (b *safeBuf) Len() int {
 	return b.sb.Len()
 }
 
+func (b *safeBuf) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sb.String()
+}
+
 // Gate-release probes (adopted from the independent review, §11.4.194(6)(d)).
 
 func TestGate_FreedAfterAcquireError(t *testing.T) {

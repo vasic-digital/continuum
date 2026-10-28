@@ -1,7 +1,7 @@
 # Continuum — instant-resume continuation engine
 
-**Revision:** 1
-**Last modified:** 2026-07-15T00:00:00Z
+**Revision:** 2
+**Last modified:** 2026-10-28T00:00:00Z
 **Status:** active
 **License:** MIT
 **Module:** `github.com/vasic-digital/continuum`
@@ -134,6 +134,20 @@ byte-identical multi-stream fresh-session round-trip **with a measured resume
 metric**, 150-iteration sustained stress (p50/p95/p99 recorded), 12-writer
 concurrent contention (zero lost updates, under `-race`), and chaos: on-disk
 corruption **detected** then recovered, and a crashed-writer stale lock reaped.
+
+## Concurrency and cost (0.1.2)
+
+- **Cross-process fair lock.** Waiters take a queue ticket; the head of the queue
+  gets the lock, so a looping holder cannot starve a waiter in another process.
+  Dead or stale tickets are reaped. See [docs/DESIGN.md](docs/DESIGN.md).
+- **Incremental ledger scan.** Appends no longer re-read the whole ledger; cost is
+  proportional to new bytes.
+- **Durability is not traded for speed.** Event and blob writes still fsync; the
+  lockfile (no durable data) no longer does. On a journalled disk a single `Set`
+  is dominated by those fsyncs (about 48 ms measured on ext4 vs 0.5 ms on tmpfs).
+
+See [CHANGELOG.md](CHANGELOG.md), the [manual](docs/MANUAL.md) and the
+[FAQ](docs/FAQ.md).
 
 ## License
 
