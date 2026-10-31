@@ -31,7 +31,7 @@ import (
 //	exec_record_run "$T/rec.jsonl" "$T/streams" -- /bin/echo hello-real-producer
 //
 // captured 2026-08-22T00:10:28Z. Nothing about it has been reshaped for Go.
-const capturedProducerRow = `{"ts":"2026-08-22T00:10:28Z","cwd":"/mnt/track1/atmosphere-t1/constitution/scripts/gates/lib","command":"/bin/echo hello-real-producer","argv":["/bin/echo","hello-real-producer"],"exit_status":"0","duration_ms":"4","stdout_digest":"fb458d7fc8693e1421ce30eb3f94df981b0d5d0379504b0b1c88591b390558b9","stderr_digest":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","stdout_bytes":"20","stderr_bytes":"0","stream_ref":"/tmp/.private/milos/tmp.Zs6jQ3bJbG/streams/20260822T001028Z_1161905","stream_truncated":"false","stream_redacted":"false"}`
+const capturedProducerRow = `{"ts":"2026-08-22T00:10:28Z","cwd":"/work/consumer/constitution/scripts/gates/lib","command":"/bin/echo hello-real-producer","argv":["/bin/echo","hello-real-producer"],"exit_status":"0","duration_ms":"4","stdout_digest":"fb458d7fc8693e1421ce30eb3f94df981b0d5d0379504b0b1c88591b390558b9","stderr_digest":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","stdout_bytes":"20","stderr_bytes":"0","stream_ref":"/tmp/.private/milos/tmp.Zs6jQ3bJbG/streams/20260822T001028Z_1161905","stream_truncated":"false","stream_redacted":"false"}`
 
 // ---------------------------------------------------------------------------
 // The fork, stated mechanically

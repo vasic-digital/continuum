@@ -115,7 +115,7 @@ func TestE2E_MultiStreamRoundTripAndResumeMetric(t *testing.T) {
 	}
 
 	// --- measured resume Metric (the token-cost proof) ---------------------
-	b, err := resume.Render(fresh, "", resume.Options{Title: "ATMOSphere fleet resume"})
+	b, err := resume.Render(fresh, "", resume.Options{Title: "Example fleet resume"})
 	if err != nil {
 		t.Fatalf("resume.Render: %v", err)
 	}
